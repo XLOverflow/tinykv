@@ -452,8 +452,8 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 
 	// 2. 如果有快照，则应用快照
 	if !raft.IsEmptySnap(&ready.Snapshot) {
-		// 将快照应用到 KV 引擎
-		applySnapResult, err := ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		var err error
+		applySnapResult, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
 		if err != nil {
 			log.Error("Failed to apply snapshot: ", err)
 			return applySnapResult, err

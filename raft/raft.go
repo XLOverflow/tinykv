@@ -312,14 +312,16 @@ func (r *Raft) sendHeartbeat(to uint64) {
 	}
 
 	// 构造心跳消息
-	// Term: 用于确保当前心跳消息是最新的。如果接收者发现心跳消息的任期比自己当前的任期大，它会更新自己的任期，并将自己转变为跟随者。
-	// Commit: 通常应该是无效索引，在这里可以设置一下，确保跟随者知道最新的提交索引。
+	// Commit 必须是 min(committed, pr.Match)，确保：
+	// 1. 不会让 follower 提交它还没有的日志
+	// 2. 新加入的 peer (Match=0) 收到 commit=0 的心跳，触发 store 创建 peer
+	commit := min(r.RaftLog.committed, r.Prs[to].Match)
 	msg := pb.Message{
-		MsgType: pb.MessageType_MsgHeartbeat, // 消息类型：心跳
-		Term:    r.Term,                      // 当前任期
-		Commit:  r.RaftLog.committed,         // 已提交的日志索引
-		To:      to,                          // 目标节点ID
-		From:    r.id,                        // 发送者节点ID
+		MsgType: pb.MessageType_MsgHeartbeat,
+		Term:    r.Term,
+		Commit:  commit,
+		To:      to,
+		From:    r.id,
 	}
 	// 添加消息到消息队列
 	r.msgs = append(r.msgs, msg)
@@ -937,14 +939,15 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	r.RaftLog.stabled = lastSnapShotIndex
 	r.RaftLog.pendingSnapshot = m.Snapshot
 
-	// 在entry里加一个entry让其和SnapShot的最后一个相同
+	// Add a dummy entry at snapshot index to ensure Term() works correctly
+	// before the snapshot is persisted to storage
 	if r.RaftLog.LastIndex() < lastSnapShotIndex {
 		entry := pb.Entry{
-			EntryType: pb.EntryType_EntryNormal, // 普通日志条目类型
-			Index:     lastSnapShotIndex,        // 条目的索引与快照的最后一个条目相同
-			Term:      lastSnapShotIndex,        // 条目的任期与快照的最后一个条目相同
+			EntryType: pb.EntryType_EntryNormal,
+			Index:     lastSnapShotIndex,
+			Term:      m.Snapshot.Metadata.Term, // Must use snapshot's term, not index
 		}
-		r.RaftLog.entries = append(r.RaftLog.entries, entry) // 将条目追加到日志中
+		r.RaftLog.entries = append(r.RaftLog.entries, entry)
 	}
 
 	// 处理ConfState集群节点变更
