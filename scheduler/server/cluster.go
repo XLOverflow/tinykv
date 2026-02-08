@@ -280,6 +280,55 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
 
+	// Check if the region already exists in the cluster
+	existingRegion := c.core.GetRegion(region.GetID())
+
+	if existingRegion != nil {
+		// Compare region epochs to detect stale heartbeats
+		existingEpoch := existingRegion.GetRegionEpoch()
+		newEpoch := region.GetRegionEpoch()
+
+		// If the existing region has a higher version, the heartbeat is stale
+		if existingEpoch.GetVersion() > newEpoch.GetVersion() {
+			return ErrRegionIsStale(region.GetMeta(), existingRegion.GetMeta())
+		}
+		if existingEpoch.GetVersion() == newEpoch.GetVersion() && existingEpoch.GetConfVer() > newEpoch.GetConfVer() {
+			return ErrRegionIsStale(region.GetMeta(), existingRegion.GetMeta())
+		}
+	} else {
+		// For a new region, check overlapping regions by searching the key range
+		// to ensure we're not inserting a stale region
+		searchRegion := c.core.SearchRegion(region.GetStartKey())
+		if searchRegion != nil && searchRegion.GetID() != region.GetID() {
+			existingEpoch := searchRegion.GetRegionEpoch()
+			newEpoch := region.GetRegionEpoch()
+			if existingEpoch.GetVersion() > newEpoch.GetVersion() {
+				return ErrRegionIsStale(region.GetMeta(), searchRegion.GetMeta())
+			}
+			if existingEpoch.GetVersion() == newEpoch.GetVersion() && existingEpoch.GetConfVer() > newEpoch.GetConfVer() {
+				return ErrRegionIsStale(region.GetMeta(), searchRegion.GetMeta())
+			}
+		}
+	}
+
+	// Update the region information in the cluster
+	c.core.PutRegion(region)
+
+	// Update store status for all stores that have peers in this region
+	storeIDs := make(map[uint64]struct{})
+	for _, peer := range region.GetPeers() {
+		storeIDs[peer.GetStoreId()] = struct{}{}
+	}
+	// Also update stores from the old region (peers might have been removed)
+	if existingRegion != nil {
+		for _, peer := range existingRegion.GetPeers() {
+			storeIDs[peer.GetStoreId()] = struct{}{}
+		}
+	}
+	for storeID := range storeIDs {
+		c.updateStoreStatusLocked(storeID)
+	}
+
 	return nil
 }
 

@@ -215,11 +215,9 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 				}
 			}
 
-			resp.Error = &kvrpcpb.KeyError{
-				Abort:     "Lock not found",
-				Retryable: "true",
-			}
-			return resp, nil
+			// Lock不存在且没有对应的Write记录，说明prewrite请求丢失了
+			// 按照Percolator协议，这是一个no-op，跳过该key继续处理
+			continue
 		}
 
 		if lock.Ts != req.StartVersion {
