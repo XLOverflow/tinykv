@@ -692,18 +692,53 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		return
 	}
 
-	// 追加新条目，同时删除冲突
-	for _, entry := range m.Entries {
+	// 追加新条目，同时删除冲突。
+	// 注意：entry.Index 可能落在已 compact 的区间，不能直接做 index-FirstIndex 切片。
+	for i, entry := range m.Entries {
 		index := entry.Index
-		oldTerm, err := r.RaftLog.Term(index)
-		if index > r.RaftLog.LastIndex() {
-			r.RaftLog.entries = append(r.RaftLog.entries, *entry)
-		} else if oldTerm != entry.Term || err != nil {
-			// 删除冲突的条目和之后的所有条目
-			r.RaftLog.entries = r.RaftLog.entries[:index-r.RaftLog.FirstIndex()]
-			r.RaftLog.stabled = min(r.RaftLog.stabled, index-1)
-			r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+		firstIndex := r.RaftLog.FirstIndex()
+		lastIndex := r.RaftLog.LastIndex()
+
+		// 已被 compact 的日志无需重复追加。
+		if index < firstIndex {
+			continue
 		}
+
+		// 新日志直接追加剩余部分。
+		if index > lastIndex {
+			for _, e := range m.Entries[i:] {
+				r.RaftLog.entries = append(r.RaftLog.entries, *e)
+			}
+			break
+		}
+
+		oldTerm, err := r.RaftLog.Term(index)
+		if err == nil && oldTerm == entry.Term {
+			continue
+		}
+
+		// 不能覆盖已经 committed 的日志，否则会破坏线性一致性。
+		if index <= r.RaftLog.committed {
+			r.sendAppendResponse(m.From, r.RaftLog.committed, true)
+			return
+		}
+
+		// 发生冲突：保留 [firstIndex, index) 区间，之后用 leader 的日志覆盖。
+		cut := uint64(0)
+		if index > firstIndex {
+			cut = index - firstIndex
+			if cut > uint64(len(r.RaftLog.entries)) {
+				cut = uint64(len(r.RaftLog.entries))
+			}
+		}
+		r.RaftLog.entries = r.RaftLog.entries[:cut]
+		if index > 0 {
+			r.RaftLog.stabled = min(r.RaftLog.stabled, index-1)
+		}
+		for _, e := range m.Entries[i:] {
+			r.RaftLog.entries = append(r.RaftLog.entries, *e)
+		}
+		break
 	}
 
 	// 发送追加的response
@@ -755,6 +790,9 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
+	if m.Term < r.Term {
+		return
+	}
 	if r.Term < m.Term {
 		r.Term = m.Term
 		if r.State != StateFollower {
@@ -765,6 +803,12 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	if m.From != r.Lead {
 		r.Lead = m.From
 	}
+
+	// Follower 在心跳上推进 committed。
+	if m.Commit > r.RaftLog.committed {
+		r.RaftLog.committed = min(m.Commit, r.RaftLog.LastIndex())
+	}
+
 	// 重置时间
 	r.electionElapsed = 0
 	// 回应
@@ -776,6 +820,9 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	// Your Code Here (2A).
 
+	if m.Term < r.Term {
+		return
+	}
 	if r.Term < m.Term {
 		r.Term = m.Term
 		if r.State != StateFollower {
@@ -792,6 +839,11 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 // handleRequestVote handle RequestVote RPC request
 func (r *Raft) handleRequestVote(m pb.Message) {
 	// Your Code Here (2A).
+	if m.Term < r.Term {
+		r.sendRequestVoteResponse(m.From, true)
+		return
+	}
+
 	// 更新任期和状态
 	if r.Term < m.Term {
 		r.Term = m.Term
@@ -804,6 +856,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 	// 如果之前已经投过一次票，这次相同直接放行
 	if r.Vote == m.From {
 		r.sendRequestVoteResponse(m.From, false)
+		r.electionElapsed = 0
 		return
 	}
 
@@ -813,14 +866,15 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		lastTerm, _ := r.RaftLog.Term(lastIndex)
 
 		// 如果候选者的日志比当前节点的日志更新，则投票给候选者
-		if m.LogTerm > lastTerm || (m.LogTerm == lastTerm && m.Index >= lastIndex) {
-			r.sendRequestVoteResponse(m.From, false)
-			// 投票并更新任期然后变换身份
-			r.Vote = m.From
-			// log.Infof("%x vote to %x at term %d\n", r.id, m.From, r.Term)
-		} else {
-			r.sendRequestVoteResponse(m.From, true)
-		}
+			if m.LogTerm > lastTerm || (m.LogTerm == lastTerm && m.Index >= lastIndex) {
+				r.sendRequestVoteResponse(m.From, false)
+				// 投票并更新任期然后变换身份
+				r.Vote = m.From
+				r.electionElapsed = 0
+				// log.Infof("%x vote to %x at term %d\n", r.id, m.From, r.Term)
+			} else {
+				r.sendRequestVoteResponse(m.From, true)
+			}
 	} else {
 		r.sendRequestVoteResponse(m.From, true)
 	}
@@ -829,6 +883,14 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 // handleRequestVoteResponse handle RequestVoteResponse RPC response
 func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 	// Your Code Here (2A).
+	if m.Term < r.Term || r.State != StateCandidate {
+		return
+	}
+	if m.Term > r.Term {
+		r.becomeFollower(m.Term, None)
+		return
+	}
+
 	totalNum := len(r.Prs)
 	agrNum := 0
 	denNum := 0
