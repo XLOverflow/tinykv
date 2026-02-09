@@ -1,15 +1,18 @@
-name: Private Grade
+name: Full CI
 
-on: [push]
+on: [push, workflow_dispatch]
 
 jobs:
-  grade-3b:
-    name: Project3B Tests
+  full-test:
+    name: Full Repository Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.19"
-      - name: Run Project 3B tests
-        run: LOG_LEVEL=error go test ./kv/test_raftstore -run '3B$' -count=1 -timeout 30m
+      - name: Run CI checks
+        run: make ci
+      - name: Run full tests
+        run: make test
