@@ -6,6 +6,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
+	"github.com/pingcap-incubator/tinykv/raft"
 )
 
 func GetRegionLocalState(db *badger.DB, regionId uint64) (*rspb.RegionLocalState, error) {
@@ -66,6 +67,36 @@ func InitRaftLocalState(raftEngine *badger.DB, region *metapb.Region) (*rspb.Raf
 				return raftState, err
 			}
 		}
+	} else if len(region.Peers) > 0 {
+		// A split peer may be pre-created by replicatePeer with empty/partial
+		// raft state. Ensure it is upgraded to a valid initialized state.
+		needUpgrade := false
+		if raftState.HardState == nil {
+			raftState.HardState = new(eraftpb.HardState)
+			needUpgrade = true
+		}
+		if raftState.LastIndex < RaftInitLogIndex {
+			raftState.LastIndex = RaftInitLogIndex
+			needUpgrade = true
+		}
+		if raftState.LastTerm < RaftInitLogTerm {
+			raftState.LastTerm = RaftInitLogTerm
+			needUpgrade = true
+		}
+		if raftState.HardState.Term < RaftInitLogTerm {
+			raftState.HardState.Term = RaftInitLogTerm
+			needUpgrade = true
+		}
+		if raft.IsEmptyHardState(*raftState.HardState) || raftState.HardState.Commit < RaftInitLogIndex {
+			raftState.HardState.Commit = RaftInitLogIndex
+			needUpgrade = true
+		}
+		if needUpgrade {
+			err = engine_util.PutMeta(raftEngine, RaftStateKey(region.Id), raftState)
+			if err != nil {
+				return raftState, err
+			}
+		}
 	}
 	return raftState, nil
 }
@@ -83,6 +114,14 @@ func InitApplyState(kvEngine *badger.DB, region *metapb.Region) (*rspb.RaftApply
 			applyState.TruncatedState.Index = RaftInitLogIndex
 			applyState.TruncatedState.Term = RaftInitLogTerm
 		}
+		err = engine_util.PutMeta(kvEngine, ApplyStateKey(region.Id), applyState)
+		if err != nil {
+			return applyState, err
+		}
+	} else if len(region.Peers) > 0 && applyState.AppliedIndex < RaftInitLogIndex {
+		applyState.AppliedIndex = RaftInitLogIndex
+		applyState.TruncatedState.Index = RaftInitLogIndex
+		applyState.TruncatedState.Term = RaftInitLogTerm
 		err = engine_util.PutMeta(kvEngine, ApplyStateKey(region.Id), applyState)
 		if err != nil {
 			return applyState, err

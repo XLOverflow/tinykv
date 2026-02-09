@@ -143,8 +143,10 @@ func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 		return true, nil
 	}
 	if fromEpoch.ConfVer == regionEpoch.ConfVer {
-		return false, errors.Errorf("tombstone peer [epoch: %s] received an invalid message %s, ignore it",
-			regionEpoch, msgType)
+		// The sender still targets a tombstone peer with the same conf version.
+		// Reply a tombstone message to accelerate stale peer cleanup.
+		handleStaleMsg(d.ctx.trans, msg, regionEpoch, true)
+		return true, nil
 	}
 	return false, nil
 }

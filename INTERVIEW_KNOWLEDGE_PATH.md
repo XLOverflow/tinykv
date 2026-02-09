@@ -1,5 +1,26 @@
 # TinyKV 面试知识路径 - 完整技术指南
 
+## 面试口述模板（先背这个）
+
+### 30 秒版本（开场）
+
+> 我做的是 TinyKV，核心是把请求通过 Multi-Raft 做强一致复制，底层用 Badger 做持久化；在其上实现了 region split、成员变更、snapshot、调度器均衡，以及基于 MVCC + Percolator 的分布式事务。  
+> 我重点解决过 split/recover 和 conf change 下的稳定性问题，保证复杂故障场景下请求不超时、节点重启可恢复。
+
+### 3 分钟版本（展开）
+
+1. 先讲架构分层：Server → Raftstore → Raft → Storage/MVCC → Scheduler。  
+2. 再讲一致性主线：提案、复制、提交、应用、回调。  
+3. 再讲复杂场景：leader transfer、conf change、split、snapshot、重启恢复。  
+4. 最后讲你做过的问题闭环：bug 现象、根因、修复、验证。  
+
+### 深挖答题顺序（避免答散）
+
+1. 先讲目标不变量（线性一致性、epoch 单调、日志顺序）。  
+2. 再讲关键结构（`proposal`、`Progress`、`RegionEpoch`）。  
+3. 再讲异常路径（proposal dropped、stale/tombstone、snapshot/recover）。  
+4. 最后讲验证手段（高压 + 不可靠网络 + 重启/分区回归）。  
+
 ## 架构总览
 
 TinyKV 是一个教学级分布式 KV 存储系统，对标 TiDB 生态的 TiKV + PD，包含四大核心模块：

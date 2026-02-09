@@ -78,7 +78,12 @@ func newLog(storage Storage) *RaftLog {
 
 	// 获取从 firstIndex 到 lastIndex+1 的所有日志条目
 	entries, err := storage.Entries(firstIndex, lastIndex+1)
-	if err != nil {
+	if err == ErrUnavailable {
+		// Persisted raft state may temporarily be ahead of local raft log files
+		// (e.g. after split/recover races). Start from empty in-memory entries
+		// and rely on snapshot/replication to heal.
+		entries = nil
+	} else if err != nil {
 		log.Panicf("failed to get entries from storage: %v", err)
 	}
 

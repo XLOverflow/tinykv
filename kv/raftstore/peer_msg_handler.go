@@ -135,17 +135,13 @@ func (d *peerMsgHandler) applyConfChangeEntry(entry *pb.Entry, kvWB *engine_util
 		}
 	}
 
+	removeSelf := false
 	// Apply the conf change to region state
 	switch cc.ChangeType {
 	case pb.ConfChangeType_AddNode:
 		d.applyAddNode(&cc, &cmdRequest, kvWB)
 	case pb.ConfChangeType_RemoveNode:
-		d.applyRemoveNode(&cc, kvWB)
-	}
-
-	// If self was destroyed, stop
-	if d.stopped {
-		return
+		removeSelf = d.applyRemoveNode(&cc, kvWB)
 	}
 
 	// Persist RegionState to DB
@@ -154,6 +150,10 @@ func (d *peerMsgHandler) applyConfChangeEntry(entry *pb.Entry, kvWB *engine_util
 
 	// Apply to Raft layer (update Prs)
 	d.RaftGroup.ApplyConfChange(cc)
+	if removeSelf {
+		d.destroyPeer()
+		return
+	}
 
 	// Notify scheduler about region change
 	d.notifyHeartbeatScheduler(d.Region(), d.peer)
@@ -191,18 +191,11 @@ func (d *peerMsgHandler) applyAddNode(cc *pb.ConfChange, req *raft_cmdpb.RaftCmd
 	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: region})
 }
 
-func (d *peerMsgHandler) applyRemoveNode(cc *pb.ConfChange, kvWB *engine_util.WriteBatch) {
+func (d *peerMsgHandler) applyRemoveNode(cc *pb.ConfChange, kvWB *engine_util.WriteBatch) bool {
 	if !d.peerExistInRegion(cc.NodeId) {
-		return
+		return false
 	}
 
-	// Self-removal
-	if d.peer.PeerId() == cc.NodeId {
-		d.destroyPeer()
-		return
-	}
-
-	// Remove another node
 	d.ctx.storeMeta.Lock()
 	defer d.ctx.storeMeta.Unlock()
 
@@ -219,6 +212,7 @@ func (d *peerMsgHandler) applyRemoveNode(cc *pb.ConfChange, kvWB *engine_util.Wr
 
 	meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
 	d.removePeerCache(cc.NodeId)
+	return d.peer.PeerId() == cc.NodeId
 }
 
 // ====================== Normal Entry Application ======================
@@ -311,8 +305,8 @@ func (d *peerMsgHandler) applySplit(entry *pb.Entry, cmdRequest *raft_cmdpb.Raft
 		return
 	}
 
-	// Validate split key is within region range
-	if err := util.CheckKeyInRegion(splitKey, region); err != nil {
+	// Validate split key is within region range and not equal to start key.
+	if err := util.CheckKeyInRegionExclusive(splitKey, region); err != nil {
 		log.Infof("%s split key %v not in region: %v", d.Tag, splitKey, err)
 		d.checkValidAndCallback(&raft_cmdpb.RaftCmdResponse{
 			Header: &raft_cmdpb.RaftResponseHeader{},
@@ -336,20 +330,21 @@ func (d *peerMsgHandler) applySplit(entry *pb.Entry, cmdRequest *raft_cmdpb.Raft
 	}
 
 	// New region takes [splitKey, oldEndKey)
+	newVersion := region.RegionEpoch.Version + 1
 	newRegion := &metapb.Region{
 		Id:       splitReq.NewRegionId,
-		StartKey: splitKey,
-		EndKey:   region.EndKey,
+		StartKey: util.SafeCopy(splitKey),
+		EndKey:   util.SafeCopy(region.EndKey),
 		RegionEpoch: &metapb.RegionEpoch{
-			ConfVer: 1,
-			Version: 1,
+			ConfVer: region.RegionEpoch.ConfVer,
+			Version: newVersion,
 		},
 		Peers: newPeers,
 	}
 
 	// Old region becomes [oldStartKey, splitKey)
-	region.EndKey = splitKey
-	region.RegionEpoch.Version++
+	region.EndKey = util.SafeCopy(splitKey)
+	region.RegionEpoch.Version = newVersion
 
 	// Persist both regions
 	meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
@@ -357,27 +352,51 @@ func (d *peerMsgHandler) applySplit(entry *pb.Entry, cmdRequest *raft_cmdpb.Raft
 	kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
 	kvWB.Reset()
 
-	// Update store metadata
+	// Update store metadata and collect pending votes for this region.
+	var existedPeer *peer
+	var pendingVotes []*rspb.RaftMessage
 	d.ctx.storeMeta.Lock()
 	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: region})
 	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
-	d.ctx.storeMeta.regions[newRegion.Id] = newRegion
+	if ps := d.ctx.router.get(newRegion.Id); ps != nil {
+		existedPeer = ps.peer
+		d.ctx.storeMeta.setRegion(newRegion, existedPeer)
+	} else {
+		d.ctx.storeMeta.regions[newRegion.Id] = newRegion
+	}
+	if len(d.ctx.storeMeta.pendingVotes) > 0 {
+		remainingVotes := d.ctx.storeMeta.pendingVotes[:0]
+		for _, vote := range d.ctx.storeMeta.pendingVotes {
+			if vote.GetRegionId() == newRegion.Id {
+				pendingVotes = append(pendingVotes, vote)
+				continue
+			}
+			remainingVotes = append(remainingVotes, vote)
+		}
+		d.ctx.storeMeta.pendingVotes = remainingVotes
+	}
 	d.ctx.storeMeta.Unlock()
 
-	// Create new peer for the split region on this store
-	newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
-	if err != nil {
-		log.Errorf("%s failed to create peer for split region: %v", d.Tag, err)
-		return
+	// Create new peer for the split region on this store if needed.
+	newPeer := existedPeer
+	if newPeer == nil {
+		createdPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
+		if err != nil {
+			log.Errorf("%s failed to create peer for split region: %v", d.Tag, err)
+			return
+		}
+		newPeer = createdPeer
+
+		d.ctx.router.register(newPeer)
+		_ = d.ctx.router.send(newRegion.Id, message.Msg{Type: message.MsgTypeStart})
+	}
+	// Let the new peer try to campaign if parent is leader.
+	newPeer.MaybeCampaign(d.IsLeader())
+	for _, vote := range pendingVotes {
+		_ = d.ctx.router.send(newRegion.Id, message.Msg{Type: message.MsgTypeRaftMessage, Data: vote})
 	}
 
-	d.ctx.router.register(newPeer)
-	_ = d.ctx.router.send(newRegion.Id, message.Msg{Type: message.MsgTypeStart})
-
-	// Let the new peer try to campaign if parent is leader
-	newPeer.MaybeCampaign(d.IsLeader())
-
-	// Notify scheduler
+	// Notify scheduler for both old and new regions.
 	d.notifyHeartbeatScheduler(region, d.peer)
 	d.notifyHeartbeatScheduler(newRegion, newPeer)
 
@@ -620,9 +639,9 @@ func (d *peerMsgHandler) proposeToRaftGroup(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 
+	var p *proposal
 	if cb != nil {
-		proposal := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
-		d.proposals = append(d.proposals, proposal)
+		p = &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
 	}
 
 	if err = d.RaftGroup.Propose(data); err != nil {
@@ -630,6 +649,10 @@ func (d *peerMsgHandler) proposeToRaftGroup(msg *raft_cmdpb.RaftCmdRequest, cb *
 		if cb != nil {
 			cb.Done(ErrResp(err))
 		}
+		return
+	}
+	if p != nil {
+		d.proposals = append(d.proposals, p)
 	}
 }
 
@@ -653,11 +676,12 @@ func (d *peerMsgHandler) handleChangePeerReq(msg *raft_cmdpb.RaftCmdRequest, adm
 	}
 
 	proposal := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
-	d.proposals = append(d.proposals, proposal)
 
 	if err = d.RaftGroup.ProposeConfChange(cc); err != nil {
 		cb.Done(ErrResp(err))
+		return
 	}
+	d.proposals = append(d.proposals, proposal)
 }
 
 func (d *peerMsgHandler) handleTransferLeaderReq(adminReq *raft_cmdpb.AdminRequest, cb *message.Callback) {
@@ -1000,12 +1024,13 @@ func (d *peerMsgHandler) destroyPeer() {
 	d.ctx.router.close(regionID)
 	d.stopped = true
 	if isInitialized && meta.regionRanges.Delete(&regionItem{region: d.Region()}) == nil {
-		panic(d.Tag + " meta corruption detected")
+		log.Warnf("%s region range item already removed when destroying peer", d.Tag)
 	}
-	if _, ok := meta.regions[regionID]; !ok {
-		panic(d.Tag + " meta corruption detected")
+	if _, ok := meta.regions[regionID]; ok {
+		delete(meta.regions, regionID)
+	} else {
+		log.Warnf("%s region meta already removed when destroying peer", d.Tag)
 	}
-	delete(meta.regions, regionID)
 }
 
 func (d *peerMsgHandler) findSiblingRegion() (result *metapb.Region) {
