@@ -866,15 +866,15 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		lastTerm, _ := r.RaftLog.Term(lastIndex)
 
 		// 如果候选者的日志比当前节点的日志更新，则投票给候选者
-			if m.LogTerm > lastTerm || (m.LogTerm == lastTerm && m.Index >= lastIndex) {
-				r.sendRequestVoteResponse(m.From, false)
-				// 投票并更新任期然后变换身份
-				r.Vote = m.From
-				r.electionElapsed = 0
-				// log.Infof("%x vote to %x at term %d\n", r.id, m.From, r.Term)
-			} else {
-				r.sendRequestVoteResponse(m.From, true)
-			}
+		if m.LogTerm > lastTerm || (m.LogTerm == lastTerm && m.Index >= lastIndex) {
+			r.sendRequestVoteResponse(m.From, false)
+			// 投票并更新任期然后变换身份
+			r.Vote = m.From
+			r.electionElapsed = 0
+			// log.Infof("%x vote to %x at term %d\n", r.id, m.From, r.Term)
+		} else {
+			r.sendRequestVoteResponse(m.From, true)
+		}
 	} else {
 		r.sendRequestVoteResponse(m.From, true)
 	}
